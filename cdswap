@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Switch Claude Desktop between saved accounts.
+
+Desktop keeps its login in three places under its data folder: the
+`oauth:tokenCacheV2` key in config.json, the claude.ai cookies, and Local
+Storage. A profile is a copy of those. Desktop reads them at startup and
+rewrites them while running, so every save or restore happens with the
+app quit. Code sessions are shared across accounts (see share_sessions).
+"""
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+APP_DATA = Path.home() / "Library/Application Support/Claude"
+PROFILES = Path.home() / ".claude-desktop-swap"
+SESSIONS = APP_DATA / "claude-code-sessions"
+CONFIG_KEYS = ["oauth:tokenCacheV2", "lastKnownAccountUuid"]
+FILES = ["Cookies", "Cookies-journal"]
+DIRS = ["Local Storage"]
+
+
+def app_running():
+    return subprocess.run(["pgrep", "-x", "Claude"], capture_output=True).returncode == 0
+
+
+def quit_app():
+    if not app_running():
+        return
+    subprocess.run(["osascript", "-e", 'quit app "Claude"'], check=True)
+    for _ in range(60):
+        if not app_running():
+            return
+        time.sleep(0.5)
+    sys.exit("Claude did not quit within 30s; quit it by hand and retry.")
+
+
+def launch_app():
+    subprocess.run(["open", "-a", "Claude"], check=True)
+
+
+def read_config():
+    return json.loads((APP_DATA / "config.json").read_text())
+
+
+def current_account():
+    return read_config().get("lastKnownAccountUuid")
+
+
+def save(name):
+    dest = PROFILES / name
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    config = read_config()
+    (dest / "config.json").write_text(json.dumps({k: config.get(k) for k in CONFIG_KEYS}))
+    for f in FILES:
+        if (APP_DATA / f).exists():
+            shutil.copy2(APP_DATA / f, dest / f)
+    for d in DIRS:
+        if (APP_DATA / d).exists():
+            shutil.copytree(APP_DATA / d, dest / d)
+    dest.chmod(0o700)
+
+
+def restore(name):
+    src = PROFILES / name
+    config = read_config()
+    config.update(json.loads((src / "config.json").read_text()))
+    (APP_DATA / "config.json").write_text(json.dumps(config, indent=2))
+    for f in FILES:
+        (APP_DATA / f).unlink(missing_ok=True)
+        if (src / f).exists():
+            shutil.copy2(src / f, APP_DATA / f)
+    for d in DIRS:
+        shutil.rmtree(APP_DATA / d, ignore_errors=True)
+        if (src / d).exists():
+            shutil.copytree(src / d, APP_DATA / d)
+
+
+def profile_for(account):
+    for p in sorted(PROFILES.glob("*/config.json")):
+        if json.loads(p.read_text()).get("lastKnownAccountUuid") == account:
+            return p.parent.name
+    return None
+
+
+def is_empty_account_state(path):
+    if path.is_dir():
+        return not any(path.iterdir())
+    if path.name == "scheduled-tasks.json":
+        return not json.loads(path.read_text()).get("scheduledTasks")
+    return False
+
+
+def share_sessions(account):
+    # Desktop lists Code sessions from claude-code-sessions/<account>/<org>/. The session
+    # files carry no account ID, so pointing every account's org folder at one real folder
+    # gives all accounts the same session list and scheduled tasks.
+    for org_dir in sorted((SESSIONS / account).glob("*")):
+        if not org_dir.is_dir() or org_dir.is_symlink():
+            continue
+        shared = next((d for d in SESSIONS.glob(f"*/{org_dir.name}")
+                       if d != org_dir and d.is_dir() and not d.is_symlink()), None)
+        if shared is None:
+            continue
+        clashes = [e for e in org_dir.iterdir()
+                   if (shared / e.name).exists() and not is_empty_account_state(e)]
+        if clashes:
+            sys.exit(f"Not linking {org_dir}: {', '.join(e.name for e in clashes)} also exist in {shared}.")
+        for entry in org_dir.iterdir():
+            if not (shared / entry.name).exists():
+                shutil.move(entry, shared / entry.name)
+        shutil.rmtree(org_dir)
+        org_dir.symlink_to(shared)
+        print(f"Linked sessions for org {org_dir.name} to {shared}.")
+
+
+def cmd_add(name):
+    quit_app()
+    save(name)
+    print(f"Saved the signed-in account ({current_account()}) as '{name}'.")
+    share_sessions(current_account())
+    launch_app()
+
+
+def save_outgoing():
+    # Saving the outgoing account keeps any token Desktop refreshed since its last save.
+    outgoing = profile_for(current_account())
+    if outgoing:
+        save(outgoing)
+    elif current_account():
+        print(f"Warning: the signed-in account {current_account()} has no profile; its login is discarded.")
+
+
+def clear():
+    config = read_config()
+    for k in CONFIG_KEYS:
+        config.pop(k, None)
+    (APP_DATA / "config.json").write_text(json.dumps(config, indent=2))
+    for f in FILES:
+        (APP_DATA / f).unlink(missing_ok=True)
+    for d in DIRS:
+        shutil.rmtree(APP_DATA / d, ignore_errors=True)
+
+
+def cmd_use(name):
+    if not (PROFILES / name / "config.json").exists():
+        sys.exit(f"No profile '{name}'. Run: cdswap add {name}")
+    quit_app()
+    save_outgoing()
+    restore(name)
+    print(f"Switched to '{name}'.")
+    launch_app()
+
+
+def cmd_new():
+    # Signing out in Desktop revokes the token server-side, which kills its saved
+    # profile, so a second account starts from a cleared local login instead.
+    quit_app()
+    save_outgoing()
+    clear()
+    print("Cleared the local login. Sign in to the new account, then run: cdswap add <name>")
+    launch_app()
+
+
+def cmd_list():
+    active = profile_for(current_account())
+    for p in sorted(PROFILES.glob("*/config.json")):
+        name = p.parent.name
+        uuid = json.loads(p.read_text()).get("lastKnownAccountUuid")
+        print(f"{'*' if name == active else ' '} {name}  {uuid}")
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["list"]:
+        cmd_list()
+    elif args == ["new"]:
+        cmd_new()
+    elif len(args) == 2 and args[0] in ("add", "use"):
+        {"add": cmd_add, "use": cmd_use}[args[0]](args[1])
+    else:
+        sys.exit("usage: cdswap new | add <name> | use <name> | list\n"
+                 "Never sign out in Desktop: it revokes the saved login. Use 'cdswap new' to add an account.")
+
+
+if __name__ == "__main__":
+    main()
