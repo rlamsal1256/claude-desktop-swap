@@ -31,4 +31,6 @@ A profile in `~/.claude-desktop-swap/<name>/` holds the account's login:
 - the `Cookies` file
 - the `Local Storage` folder
 
-Desktop stores Code sessions in `claude-code-sessions/<account>/<org>/`. The session files hold no account ID, so `add` replaces the new account's org folder with a symlink to the existing one. All accounts then see the same sessions and scheduled tasks. Cowork sessions are not shared.
+Desktop stores Code sessions in `claude-code-sessions/<account>/<org>/`. The session files hold no account ID, so `add` and `use` move each org's folder under the signed-in account. All accounts then see the same sessions and scheduled tasks. Cowork sessions are not shared.
+
+The folder moves rather than being symlinked because Desktop reads through a symlinked folder but fails every save into it (`ENOTDIR`). It keeps the unsaved state in memory, so nothing looks wrong until the next restart drops it.

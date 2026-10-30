@@ -5,7 +5,7 @@ Desktop keeps its login in three places under its data folder: the
 `oauth:tokenCacheV2` key in config.json, the claude.ai cookies, and Local
 Storage. A profile is a copy of those. Desktop reads them at startup and
 rewrites them while running, so every save or restore happens with the
-app quit. Code sessions are shared across accounts (see share_sessions).
+app quit. Code sessions are shared across accounts (see claim_sessions).
 """
 import json
 import shutil
@@ -95,34 +95,47 @@ def is_empty_account_state(path):
     return False
 
 
-def share_sessions(account):
+def profile_accounts():
+    return {json.loads(p.read_text()).get("lastKnownAccountUuid") for p in PROFILES.glob("*/config.json")}
+
+
+def claim_sessions(account):
     # Desktop lists Code sessions from claude-code-sessions/<account>/<org>/. The session
-    # files carry no account ID, so pointing every account's org folder at one real folder
-    # gives all accounts the same session list and scheduled tasks.
-    for org_dir in sorted((SESSIONS / account).glob("*")):
-        if not org_dir.is_dir() or org_dir.is_symlink():
+    # files carry no account ID, so moving each org's folder under the signed-in account
+    # gives every account the same sessions and scheduled tasks. Desktop refuses to save
+    # into a symlinked folder, so the folder itself moves.
+    others = profile_accounts() - {account, None}
+    orgs = {d.name for a in others | {account} for d in (SESSIONS / a).glob("*") if d.is_dir()}
+    for org in sorted(orgs):
+        target = SESSIONS / account / org
+        if target.is_symlink():
+            target.unlink()
+        shared = [SESSIONS / a / org for a in sorted(others)
+                  if (SESSIONS / a / org).is_dir() and not (SESSIONS / a / org).is_symlink()]
+        if not shared:
             continue
-        shared = next((d for d in SESSIONS.glob(f"*/{org_dir.name}")
-                       if d != org_dir and d.is_dir() and not d.is_symlink()), None)
-        if shared is None:
-            continue
-        clashes = [e for e in org_dir.iterdir()
-                   if (shared / e.name).exists() and not is_empty_account_state(e)]
-        if clashes:
-            sys.exit(f"Not linking {org_dir}: {', '.join(e.name for e in clashes)} also exist in {shared}.")
-        for entry in org_dir.iterdir():
-            if not (shared / entry.name).exists():
-                shutil.move(entry, shared / entry.name)
-        shutil.rmtree(org_dir)
-        org_dir.symlink_to(shared)
-        print(f"Linked sessions for org {org_dir.name} to {shared}.")
+        if len(shared) > 1:
+            sys.exit(f"Sessions for org {org} exist under more than one account: {', '.join(map(str, shared))}")
+        shared = shared[0]
+        if target.exists():
+            clashes = [e for e in target.iterdir()
+                       if (shared / e.name).exists() and not is_empty_account_state(e)]
+            if clashes:
+                sys.exit(f"Not moving {shared}: {', '.join(e.name for e in clashes)} also exist in {target}.")
+            for entry in target.iterdir():
+                if not (shared / entry.name).exists():
+                    shutil.move(entry, shared / entry.name)
+            shutil.rmtree(target)
+        target.parent.mkdir(exist_ok=True)
+        shared.rename(target)
+        print(f"Moved sessions for org {org} to the signed-in account.")
 
 
 def cmd_add(name):
     quit_app()
     save(name)
     print(f"Saved the signed-in account ({current_account()}) as '{name}'.")
-    share_sessions(current_account())
+    claim_sessions(current_account())
     launch_app()
 
 
@@ -152,6 +165,7 @@ def cmd_use(name):
     quit_app()
     save_outgoing()
     restore(name)
+    claim_sessions(current_account())
     print(f"Switched to '{name}'.")
     launch_app()
 
