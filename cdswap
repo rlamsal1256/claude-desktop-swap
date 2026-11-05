@@ -8,6 +8,7 @@ rewrites them while running, so every save or restore happens with the
 app quit. Code sessions are shared across accounts (see claim_sessions).
 """
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -38,7 +39,13 @@ def quit_app():
 
 
 def launch_app():
-    subprocess.run(["open", "-a", "Claude"], check=True)
+    # `open` hands this process's environment to Desktop. The pyenv shim that
+    # runs this script exports PYENV_DIR (the folder cdswap was run from), and
+    # that folder may be the session folder claim_sessions just moved. Every
+    # python call under Desktop then fails with pyenv's "cannot change
+    # working directory".
+    env = {k: v for k, v in os.environ.items() if k != "PYENV_DIR"}
+    subprocess.run(["open", "-a", "Claude"], check=True, env=env)
 
 
 def read_config():
